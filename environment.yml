@@ -12,3 +12,7 @@ dependencies:
   - folium
   - certifi
   - pyarrow
+  - earthengine-api
+  - rasterio
+  - scipy
+  - scikit-image

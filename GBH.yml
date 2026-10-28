@@ -1,0 +1,18 @@
+name: GBA
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - jupyter
+  - notebook
+  - osmnx
+  - geopandas
+  - pandas
+  - shapely
+  - folium
+  - certifi
+  - pyarrow
+  - earthengine-api
+  - rasterio
+  - scipy
+  - scikit-image
