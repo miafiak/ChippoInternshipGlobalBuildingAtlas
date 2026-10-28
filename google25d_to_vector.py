@@ -40,6 +40,9 @@ from skimage.segmentation import watershed
 COLLECTION = "GOOGLE/Research/open-buildings-temporal/v1"
 BANDS = ["building_presence", "building_height", "building_fractional_count"]
 PIXEL_M = 4  # native resolution of the product
+VECTOR_COLUMNS = [
+    "height_mean", "height_median", "height_max", "presence_mean", "fractional_count_sum", "area_m2",
+]
 
 
 def load_aoi(bbox, aoi_path):
@@ -69,7 +72,7 @@ def build_image(aoi_wgs84, year):
     )
     n = collection.size().getInfo()
     if n == 0:
-        raise SystemExit(
+        raise RuntimeError(
             f"No 2.5D images for {year} in this AOI. It is probably outside the coverage "
             "(Africa, South/Southeast Asia, Latin America & the Caribbean) or the year is unavailable."
         )
@@ -138,7 +141,9 @@ def vectorize(arr, transform, crs, aoi_utm, threshold, sigma, min_distance, simp
     aoi_mask = rasterize([(aoi_utm, 1)], out_shape=presence.shape, transform=transform, fill=0).astype(bool)
     mask = (presence > threshold) & aoi_mask
     if not mask.any():
-        raise SystemExit("No pixels above the presence threshold in this AOI.")
+        return gpd.GeoDataFrame(
+            {c: [] for c in VECTOR_COLUMNS}, geometry=gpd.GeoSeries([], crs=crs), crs=crs
+        )
 
     labels = split_blobs(mask, sigma, min_distance)
     idx = np.unique(labels[labels > 0])
@@ -148,7 +153,8 @@ def vectorize(arr, transform, crs, aoi_utm, threshold, sigma, min_distance, simp
         "height_median": ndi.median(height, labels, idx),
         "height_max": ndi.maximum(height, labels, idx),
         "presence_mean": ndi.mean(presence, labels, idx),
-        "count_est": ndi.sum(frac_count, labels, idx),  # sum of fractional count; ~1 per single building
+        # Sum of the building_fractional_count band. Its scaling is unverified, so do NOT read it as a building count.
+        "fractional_count_sum": ndi.sum(frac_count, labels, idx),
     }
     stats_gdf = gpd.GeoDataFrame(stats, index=idx)
 
@@ -163,6 +169,32 @@ def vectorize(arr, transform, crs, aoi_utm, threshold, sigma, min_distance, simp
         gdf["geometry"] = gdf.geometry.simplify(simplify_m, preserve_topology=True)
     return gdf.reset_index(drop=True)
 
+
+def fetch_raster(aoi_wgs84, year=2019, tile_m=4000):
+    """Download the 2.5D bands for the AOI once. Pass the result to vectorize_raster() as often as needed."""
+    crs = utm_crs_for(aoi_wgs84)
+    aoi_utm = gpd.GeoSeries([aoi_wgs84], crs="EPSG:4326").to_crs(crs).iloc[0]
+    print(f"AOI area: {aoi_utm.area / 1e6:.2f} km2, working CRS {crs}")
+    image = build_image(aoi_wgs84, year)
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = download_tiles(image, aoi_utm, crs, tile_m, tmp)
+        arr, transform = merge_tiles(paths)
+    return {"arr": arr, "transform": transform, "crs": crs, "aoi_utm": aoi_utm, "year": year}
+
+
+def vectorize_raster(raster, threshold=0.5, split_sigma=1.0, split_min_distance=3, simplify_m=1.5, min_area_m2=20.0):
+    """Polygons (EPSG:4326) from a raster returned by fetch_raster(). Empty GeoDataFrame if nothing passes."""
+    gdf = vectorize(raster["arr"], raster["transform"], raster["crs"], raster["aoi_utm"],
+                    threshold, split_sigma, split_min_distance, simplify_m, min_area_m2)
+    gdf["year"] = raster["year"]
+    gdf["source"] = "Google Open Buildings 2.5D Temporal (vectorized)"
+    gdf.insert(0, "id", np.arange(len(gdf)))
+    return gdf.to_crs("EPSG:4326")
+
+
+def google25d_vectors(aoi_wgs84, year=2019, tile_m=4000, **vector_kwargs):
+    """One call: download + vectorize. vector_kwargs go to vectorize_raster()."""
+    return vectorize_raster(fetch_raster(aoi_wgs84, year, tile_m), **vector_kwargs)
 
 
 def main():
@@ -185,21 +217,15 @@ def main():
     ee.Initialize(project=args.project) if args.project else ee.Initialize()
 
     aoi = load_aoi(args.bbox, args.aoi)
-    crs = utm_crs_for(aoi)
-    aoi_utm = gpd.GeoSeries([aoi], crs="EPSG:4326").to_crs(crs).iloc[0]
-    print(f"AOI area: {aoi_utm.area / 1e6:.2f} km2, working CRS {crs}")
-
-    image = build_image(aoi, args.year)
-    with tempfile.TemporaryDirectory() as tmp:
-        paths = download_tiles(image, aoi_utm, crs, args.tile_size, tmp)
-        arr, transform = merge_tiles(paths)
-
-    gdf = vectorize(arr, transform, crs, aoi_utm, args.threshold, args.split_sigma,
-                    args.split_min_distance, args.simplify, args.min_area)
-    gdf["year"] = args.year
-    gdf["source"] = "Google Open Buildings 2.5D Temporal (vectorized)"
-    gdf.insert(0, "id", np.arange(len(gdf)))
-    gdf = gdf.to_crs("EPSG:4326")
+    try:
+        gdf = google25d_vectors(
+            aoi, args.year, args.tile_size, threshold=args.threshold, split_sigma=args.split_sigma,
+            split_min_distance=args.split_min_distance, simplify_m=args.simplify, min_area_m2=args.min_area,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc))
+    if gdf.empty:
+        raise SystemExit("No pixels above the presence threshold in this AOI.")
 
     if args.out.lower().endswith((".parquet", ".geoparquet")):
         gdf.to_parquet(args.out)
