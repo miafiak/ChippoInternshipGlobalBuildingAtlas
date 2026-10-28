@@ -16,3 +16,4 @@ dependencies:
   - rasterio
   - scipy
   - scikit-image
+  - ipywidgets
